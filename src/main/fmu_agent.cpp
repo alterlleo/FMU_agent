@@ -316,6 +316,7 @@ int main(int argc, char *const *argv) {
         console_out[2] = to_string(t) + " s";
         plant.do_step(dt);
         plant.get_status(status);
+        add_jacobian(status);
         auto tet = chrono::steady_clock::now() - now;
         status["TET"] =
           chrono::duration_cast<chrono::microseconds>(tet).count();
@@ -362,7 +363,8 @@ int main(int argc, char *const *argv) {
       }
       // Integrate
       plant.do_step(dt);
-      plant.get_status(status)
+      plant.get_status(status);
+      add_jacobian(status);
       console_out[2] = to_string(t) + " s";
       auto tet = chrono::steady_clock::now() - now;
       status["TET"] =
