@@ -48,6 +48,8 @@ bool inspect_fmu(filesystem::path const &path) {
        << "\nrelative_tol = 1e-4"
        << "\nabsolute_tol = 1e-5"
        << "\nhmin_tol = 1e-10" 
+       << "\njacobian = false       # Model Exchange only"
+       << "\njacobian_every = 1     # publish every N steps"
        << "\n[fmu_" << model_name << ".parameters]"
        << "\n# default values from FMU";
   for (const auto &param : fmu.get_param_names()) {
@@ -81,6 +83,9 @@ int main(int argc, char *const *argv) {
   double relative_tol = 1e-5;
   double absolute_tol = 1e-7;
   double hmin = 1e-12;
+  bool jacobian = false;
+  int jacobian_every = 1; // just if it is needed to jump steps
+  unsigned long step_count = 0;
 
   // Parse command line options ================================================
   Options options(argv[0]);
@@ -91,6 +96,7 @@ int main(int argc, char *const *argv) {
     ("p,period", "Sampling period (default 100 ms)", value<size_t>())
     ("n,name", "Agent name (default to fmu_<model name>)", value<string>())
     ("t,trigger", "Enable trigger mode")
+    ("j,jacobian", "Publish the Jacobian A=df/dx, B=df/du (Model Exchange only)")
     ("i,agent-id", "Agent ID to be added to JSON frames", value<string>())
     ("inspect", "Inspect the FMU and exit");
   // clang-format on
@@ -163,6 +169,25 @@ int main(int argc, char *const *argv) {
     trigger_mode = true;
   }
 
+  jacobian = settings.value("jacobian", jacobian);
+  if (options_parsed.count("jacobian") != 0) {
+    jacobian = true;
+  }
+  jacobian_every = max(1, settings.value("jacobian_every", jacobian_every));
+  if (jacobian && plant.get_type() != static_cast<int>(FmuType::ModelExchange)) {
+    cout << fg::yellow << "Jacobian is available for Model Exchange FMUs only: disabled"
+         << fg::reset << endl;
+    jacobian = false;
+  }
+  // if jacobian is enabled
+  auto add_jacobian = [&](json &st) {
+    if (jacobian && (step_count++ % jacobian_every == 0)) {
+      json jac;
+      plant.get_jacobian(jac);
+      st["jacobian"] = jac;
+    }
+  };
+
   // Connection
   agent.enable_remote_control();
   agent.connect();
@@ -184,8 +209,15 @@ int main(int argc, char *const *argv) {
        << endl
        << "  absolutre tol:    " << style::bold << absolute_tol << style::reset
        << endl
-       << "  hmin:             " << style::bold << hmin << style::reset 
-       << endl;
+       << "  hmin:             " << style::bold << hmin << style::reset
+       << endl
+       << "  jacobian:        " << style::bold
+       << (jacobian ? (plant.provides_directional_derivatives()
+                           ? "directional derivatives"
+                           : "central differences")
+                    : "off")
+       << (jacobian ? ", every " + to_string(jacobian_every) + " step(s)" : "")
+       << style::reset << endl;
   plant._solver_params._rel_tol = 1e-5;
   plant._solver_params._abs_tol = 1e-7;
   plant._solver_params._hmin = 1e-12;
@@ -330,7 +362,7 @@ int main(int argc, char *const *argv) {
       }
       // Integrate
       plant.do_step(dt);
-      plant.get_status(status);
+      plant.get_status(status)
       console_out[2] = to_string(t) + " s";
       auto tet = chrono::steady_clock::now() - now;
       status["TET"] =

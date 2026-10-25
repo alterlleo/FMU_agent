@@ -460,6 +460,82 @@ std::vector<std::string> parse_dependency_output(const std::string &output) {
   return deps;
 }
 
+// Read the continuous states of a Model Exchange FMU from modelDescription.xml.
+// The order of <ContinuousStateDerivative> in <ModelStructure> is the order of
+// fmi3GetContinuousStates; each derivative variable points to its state via
+// the "derivative" attribute (a value reference in FMI 3.0).
+void parse_continuous_states(const std::string &xml,
+                             std::vector<std::string> &state_names,
+                             std::vector<fmi3ValueReference> &state_vrs,
+                             std::vector<fmi3ValueReference> &der_vrs) {
+  state_names.clear();
+  state_vrs.clear();
+  der_vrs.clear();
+
+  struct XmlVar {
+    std::string name;
+    bool has_derivative = false;
+    fmi3ValueReference derivative = 0;
+  };
+  std::unordered_map<fmi3ValueReference, XmlVar> vars;
+
+  const std::size_t mv_begin = xml.find("<ModelVariables");
+  const std::size_t mv_end = xml.find("</ModelVariables>");
+  if (mv_begin == std::string::npos || mv_end == std::string::npos) {
+    return;
+  }
+  constexpr const char *tags[] = {"<Float64 ", "<Float32 "};
+  for (const auto *marker : tags) {
+    std::size_t pos = mv_begin;
+    while ((pos = xml.find(marker, pos)) != std::string::npos && pos < mv_end) {
+      const std::size_t tag_end = xml.find('>', pos);
+      if (tag_end == std::string::npos) {
+        break;
+      }
+      const std::string header = xml.substr(pos, tag_end - pos + 1);
+      std::string name, vr, der;
+      if (extract_xml_attribute(header, "name", name) &&
+          extract_xml_attribute(header, "valueReference", vr)) {
+        XmlVar v;
+        v.name = name;
+        if (extract_xml_attribute(header, "derivative", der)) {
+          v.has_derivative = true;
+          v.derivative = static_cast<fmi3ValueReference>(std::stoul(der));
+        }
+        vars[static_cast<fmi3ValueReference>(std::stoul(vr))] = v;
+      }
+      pos = tag_end + 1;
+    }
+  }
+
+  const std::size_t ms_begin = xml.find("<ModelStructure");
+  if (ms_begin == std::string::npos) {
+    return;
+  }
+  const std::string marker = "<ContinuousStateDerivative";
+  std::size_t pos = ms_begin;
+  while ((pos = xml.find(marker, pos)) != std::string::npos) {
+    const std::size_t tag_end = xml.find('>', pos);
+    if (tag_end == std::string::npos) {
+      break;
+    }
+    const std::string header = xml.substr(pos, tag_end - pos + 1);
+    std::string vr;
+    if (extract_xml_attribute(header, "valueReference", vr)) {
+      const auto der_vr = static_cast<fmi3ValueReference>(std::stoul(vr));
+      const auto it = vars.find(der_vr);
+      if (it != vars.end() && it->second.has_derivative) {
+        const auto st = vars.find(it->second.derivative);
+        der_vrs.push_back(der_vr);
+        state_vrs.push_back(it->second.derivative);
+        state_names.push_back(st != vars.end() ? st->second.name
+                                               : "x" + std::to_string(state_names.size()));
+      }
+    }
+    pos = tag_end + 1;
+  }
+}
+
 } // namespace
 
 // Static map initializations for enum-to-string translation
@@ -596,6 +672,16 @@ FmuWrapper::FmuWrapper(const std::string &fmu_path,
 
     _type = FmuType::ModelExchange;
     _instance = fmi3_instantiateModelExchange(_fmu, false, false, nullptr, nullptr);
+
+    size_t me_pos = _model_description_xml.find("<ModelExchange");
+    size_t me_end = _model_description_xml.find(">", me_pos);
+    string me_tag = _model_description_xml.substr(me_pos, me_end - me_pos + 1);
+    string dir_der;
+    if (extract_xml_attribute(me_tag, "providesDirectionalDerivatives", dir_der) ||
+        extract_xml_attribute(me_tag, "providesDirectionalDerivative", dir_der)) {
+      _provides_dir_der = (dir_der == "true" || dir_der == "1");
+    }
+    parse_continuous_states(_model_description_xml, _state_names, _state_vrs, _der_vrs);
 
   } else{
 
@@ -904,6 +990,17 @@ void FmuWrapper::do_step(double dt) {
   
 }
 
+void FmuWrapper::get_state_derivatives(fmi3Float64 *derivatives, size_t nx,
+                                       const std::string &context) {
+  // f evaluated at the PREVIOUS states. Getting the states first forces the refresh; for other FMUs it is just a harmless extra call
+
+  _deriv_scratch.resize(nx);
+  check_status(fmi3_getContinuousStates(_instance, _deriv_scratch.data(), nx),
+               context);
+  check_status(fmi3_getContinuousStateDerivatives(_instance, derivatives, nx),
+               context);
+}
+
 void FmuWrapper::handle_events() {
   if (!_instance || !_initialized) {
     throw std::runtime_error("FMU instance not initialized");
@@ -929,6 +1026,194 @@ void FmuWrapper::handle_events() {
           "FMU requested termination during event handling");
     }
   }
+}
+
+void FmuWrapper::get_jacobian(json &jac) {
+  if (!_instance || !_initialized) {
+    throw std::runtime_error("FMU instance not initialized");
+  }
+  if (_type != FmuType::ModelExchange) {
+    throw std::runtime_error("Jacobian is available for Model Exchange FMUs only");
+  }
+
+  size_t nx = 0;
+  check_status(fmi3_getNumberOfContinuousStates(_instance, &nx), "getNumberOfContinuousStates");
+
+  // Float64 inputs (scalars and arrays), flattened in declaration order
+  if (!_jac_inputs_ready) {
+    for (const auto &name : _in_vars) {
+      const auto meta = parse_real_array_metadata(_model_description_xml, name);
+      if (!meta._is_float64) {
+        continue;
+      }
+      _jac_inputs.push_back(
+          {name, resolve_var_ref(name), meta._is_array ? meta._length : 1});
+    }
+    _jac_inputs_ready = true;
+  }
+  size_t nu = 0;
+  for (const auto &in : _jac_inputs) {
+    nu += in.len;
+  }
+
+  auto get_derivatives = [&](std::vector<double> &f) {
+    get_state_derivatives(f.data(), nx, "getContinuousStateDerivatives (jacobian)");
+  };
+  auto set_states = [&](const std::vector<double> &x) {
+    check_status(fmi3_setContinuousStates(_instance, x.data(), nx),
+                 "setContinuousStates (jacobian)");
+  };
+  auto set_inputs = [&](const std::vector<double> &u) {
+    size_t k = 0;
+    for (const auto &in : _jac_inputs) {
+      check_status(fmi3_setFloat64(_instance, &in.vr, 1, u.data() + k, in.len),
+                   "setFloat64 (jacobian) for " + in.name);
+      k += in.len;
+    }
+  };
+
+  // Linearization point
+  std::vector<double> x0(nx), f0(nx), u0(nu);
+  if (nx > 0) {
+    check_status(fmi3_getContinuousStates(_instance, x0.data(), nx),
+                 "getContinuousStates (jacobian)");
+    get_derivatives(f0);
+  }
+  {
+    size_t k = 0;
+    for (const auto &in : _jac_inputs) {
+      check_status(fmi3_getFloat64(_instance, &in.vr, 1, u0.data() + k, in.len),
+                   "getFloat64 (jacobian) for " + in.name);
+      k += in.len;
+    }
+  }
+
+  std::vector<double> A(nx * nx, 0.0), B(nx * nu, 0.0);
+  std::string method;
+
+  // 1. Exact directional derivatives, if the FMU declares them.
+  //    Some exporters (e.g. Simulink) ship an empty stub that returns fmi3OK
+  //    without writing anything: the NaN pre-fill detects that, and we fall
+  //    back to finite differences for the rest of the run.
+  if (_provides_dir_der && nx > 0 && _der_vrs.size() == nx) {
+    std::vector<fmi3ValueReference> knowns(_state_vrs);
+    for (const auto &in : _jac_inputs) {
+      knowns.push_back(in.vr);
+    }
+    const size_t nseed = nx + nu;
+    std::vector<double> seed(nseed, 0.0), sens(nx);
+    bool ok = true;
+    for (size_t j = 0; j < nseed && ok; ++j) {
+      std::fill(seed.begin(), seed.end(), 0.0);
+      seed[j] = 1.0;
+      std::fill(sens.begin(), sens.end(),
+                std::numeric_limits<double>::quiet_NaN());
+      const fmi3Status s = fmi3_getDirectionalDerivative(
+          _instance, _der_vrs.data(), nx, knowns.data(), knowns.size(),
+          seed.data(), nseed, sens.data(), nx);
+      if (s != fmi3OK) {
+        ok = false;
+        break;
+      }
+      for (size_t i = 0; i < nx; ++i) {
+        if (std::isnan(sens[i])) {
+          ok = false;
+          break;
+        }
+        if (j < nx) {
+          A[i * nx + j] = sens[i];
+        } else {
+          B[i * nu + (j - nx)] = sens[i];
+        }
+      }
+    }
+    if (ok) {
+      method = "directional_derivative";
+    } else {
+      _provides_dir_der = false; // unusable: don't try again
+    }
+  }
+
+  // 2. Central finite differences on f(x, u)
+  if (method.empty()) {
+    method = "central_difference";
+    const double eps = std::cbrt(std::numeric_limits<double>::epsilon());
+    std::vector<double> fp(nx), fm(nx);
+
+    std::vector<double> x(x0);
+    for (size_t j = 0; j < nx; ++j) {
+      const double h = eps * std::max(1.0, std::abs(x0[j]));
+      x[j] = x0[j] + h;
+      set_states(x);
+      get_derivatives(fp);
+      x[j] = x0[j] - h;
+      set_states(x);
+      get_derivatives(fm);
+      x[j] = x0[j];
+      for (size_t i = 0; i < nx; ++i) {
+        A[i * nx + j] = (fp[i] - fm[i]) / (2.0 * h);
+      }
+    }
+    if (nx > 0) {
+      set_states(x0);
+    }
+
+    std::vector<double> u(u0);
+    for (size_t j = 0; j < nu && nx > 0; ++j) {
+      const double h = eps * std::max(1.0, std::abs(u0[j]));
+      u[j] = u0[j] + h;
+      set_inputs(u);
+      get_derivatives(fp);
+      u[j] = u0[j] - h;
+      set_inputs(u);
+      get_derivatives(fm);
+      u[j] = u0[j];
+      for (size_t i = 0; i < nx; ++i) {
+        B[i * nu + j] = (fp[i] - fm[i]) / (2.0 * h);
+      }
+    }
+    if (nu > 0) {
+      set_inputs(u0);
+    }
+  }
+
+  // Leave the FMU at the linearization point
+  if (nx > 0) {
+    set_states(x0);
+    get_derivatives(f0);
+  }
+
+  // Output
+  std::vector<std::string> state_names(_state_names);
+  if (state_names.size() != nx) {
+    state_names.clear();
+    for (size_t i = 0; i < nx; ++i) {
+      state_names.push_back("x" + std::to_string(i));
+    }
+  }
+  std::vector<std::string> input_names;
+  for (const auto &in : _jac_inputs) {
+    if (in.len == 1) {
+      input_names.push_back(in.name);
+    } else {
+      for (size_t e = 0; e < in.len; ++e) {
+        input_names.push_back(in.name + "[" + std::to_string(e) + "]");
+      }
+    }
+  }
+  json jA = json::array(), jB = json::array();
+  for (size_t i = 0; i < nx; ++i) {
+    jA.push_back(std::vector<double>(A.begin() + i * nx, A.begin() + (i + 1) * nx));
+    jB.push_back(std::vector<double>(B.begin() + i * nu, B.begin() + (i + 1) * nu));
+  }
+  jac.clear();
+  jac["method"] = method;
+  jac["states"] = state_names;
+  jac["inputs"] = input_names;
+  jac["x"] = x0;
+  jac["xdot"] = f0;
+  jac["A"] = jA;
+  jac["B"] = jB;
 }
 
 void FmuWrapper::set_real(const std::string &name, double value) {

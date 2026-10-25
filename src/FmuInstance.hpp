@@ -100,6 +100,18 @@ public:
     bool get_fixed_step() const { return _fixed_step; }
     double get_step_size() const { return _step_size; }
 
+    /// Linearize the Model Exchange dynamics dx/dt = f(x, u) at the current
+    /// state and inputs: A = df/dx (nx x nx), B = df/du (nx x nu).
+    /// Uses fmi3GetDirectionalDerivative when the FMU declares
+    /// providesDirectionalDerivatives="true", otherwise central finite
+    /// differences on fmi3GetContinuousStateDerivatives. The FMU states and
+    /// inputs are restored before returning.
+    /// Fills jac with: method, states, inputs, x, xdot, A, B (row-major,
+    /// row i = derivative of state i).
+    /// @throws std::runtime_error if the FMU is not Model Exchange
+    void get_jacobian(json &jac);
+    bool provides_directional_derivatives() const { return _provides_dir_der; }
+
     struct SolverParams {
         double _rel_tol = 1e-6;
         double _abs_tol = 1e-8;
@@ -134,6 +146,19 @@ private:
     bool _fixed_step = false;
     double _step_size = 0.0;
 
+    // Jacobian (Model Exchange only)
+    struct JacInput {
+        std::string name;
+        fmi3ValueReference vr;
+        size_t len;
+    };
+    bool _provides_dir_der = false;
+    std::vector<std::string> _state_names;        // from modelDescription.xml
+    std::vector<fmi3ValueReference> _state_vrs;   // in fmi3GetContinuousStates order
+    std::vector<fmi3ValueReference> _der_vrs;     // matching state derivatives
+    std::vector<JacInput> _jac_inputs;            // Float64 inputs, flattened
+    bool _jac_inputs_ready = false;
+
     /// Resolve variable name to value reference
     fmi3ValueReference resolve_var_ref(const std::string& name) const;
     size_t resolve_real_array_length(const std::string& name) const;
@@ -149,4 +174,10 @@ private:
     
     /// Handle discrete state updates and events
     void handle_events();
+
+    /// fmi3GetContinuousStateDerivatives, made safe for FMUs (e.g. Simulink)
+    /// that refresh their outputs lazily on get calls only
+    void get_state_derivatives(fmi3Float64 *derivatives, size_t nx,
+                               const std::string &context);
+    std::vector<fmi3Float64> _deriv_scratch;
 };
