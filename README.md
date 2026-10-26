@@ -126,3 +126,33 @@ mads fmu my_model.fmu -t
 
 The command-line flag always takes precedence over the INI setting.
 
+## Jacobian (Model Exchange only)
+
+For **model exchange** FMUs the agent can publish the linearization of the model dynamics $\dot x = f(x, u)$ at the current state, e.g. to feed an Extended Kalman Filter:
+
+```toml
+[fmu_<model_name>]
+jacobian = true      # or -j / --jacobian on the command line
+jacobian_every = 1   # compute and publish every N steps (default 1)
+```
+
+The published status then contains a `jacobian` object:
+
+```json
+"jacobian": {
+  "method": "central_difference",
+  "states": ["x1", "x2"],
+  "inputs": ["setpoint[0]", "setpoint[1]"],
+  "x":    [0.1, 0.0],
+  "xdot": [0.0, 0.2],
+  "A": [[0.0, 1.0], [-100.0, -2.0]],
+  "B": [[0.0, 0.0], [100.0, 0.0]]
+}
+```
+
+- `A` = ∂f/∂x (nx × nx) and `B` = ∂f/∂u (nx × nu), row *i* being the derivative of state *i*; they are **continuous-time** matrices, evaluated at the state `x` reached at the end of the step, with the inputs applied during that step.
+- `states` are the names from `modelDescription.xml` (the variables pointed by the `derivative` attribute of the `<ContinuousStateDerivative>` entries), `inputs` are the `Float64` inputs, with arrays flattened.
+- If the FMU declares `providesDirectionalDerivatives="true"`, `fmi3GetDirectionalDerivative` is used (`"method": "directional_derivative"`); otherwise the Jacobian is computed with central finite differences on `fmi3GetContinuousStateDerivatives` (2·(nx + nu) evaluations). Simulink-exported FMUs do not provide directional derivatives (the function is an empty stub), so they always use finite differences.
+- The FMU states and inputs are restored after the computation, so the simulation is not affected.
+- For co-simulation FMUs the option is ignored with a warning: FMI 3.0 gives no access to the internal states of a co-simulation FMU.
+
