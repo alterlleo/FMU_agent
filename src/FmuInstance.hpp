@@ -112,6 +112,16 @@ public:
     void get_jacobian(json &jac);
     bool provides_directional_derivatives() const { return _provides_dir_der; }
 
+    /// Continuous states (Model Exchange only), in fmi3GetContinuousStates
+    /// order, i.e. the same order as the rows of the Jacobian.
+    /// @throws std::runtime_error if the FMU is not Model Exchange
+    size_t get_num_states();
+    std::vector<std::string> get_state_names();
+    void get_continuous_states(std::vector<double> &x);
+    void set_continuous_states(const std::vector<double> &x);
+    /// dx/dt = f(x, u) at the current states and inputs
+    void get_continuous_state_derivatives(std::vector<double> &xdot);
+
     struct SolverParams {
         double _rel_tol = 1e-6;
         double _abs_tol = 1e-8;

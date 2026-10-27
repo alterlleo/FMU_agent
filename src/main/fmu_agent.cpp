@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <mads.hpp>
 #include <rang.hpp>
+#include <algorithm>
 #include <array>
 #ifndef __linux__
 #include <format>
@@ -50,6 +51,7 @@ bool inspect_fmu(filesystem::path const &path) {
        << "\nhmin_tol = 1e-10" 
        << "\njacobian = false       # Model Exchange only"
        << "\njacobian_every = 1     # publish every N steps"
+       << "\nclosed_loop = false    # Model Exchange only, implies trigger_mode"
        << "\n[fmu_" << model_name << ".parameters]"
        << "\n# default values from FMU";
   for (const auto &param : fmu.get_param_names()) {
@@ -86,6 +88,7 @@ int main(int argc, char *const *argv) {
   bool jacobian = false;
   int jacobian_every = 1; // just if it is needed to jump steps
   unsigned long step_count = 0;
+  bool closed_loop = false;
 
   // Parse command line options ================================================
   Options options(argv[0]);
@@ -97,6 +100,7 @@ int main(int argc, char *const *argv) {
     ("n,name", "Agent name (default to fmu_<model name>)", value<string>())
     ("t,trigger", "Enable trigger mode")
     ("j,jacobian", "Publish the Jacobian A=df/dx, B=df/du (Model Exchange only)")
+    ("c,closed-loop", "Accept state corrections from MADS (Model Exchange only, implies trigger mode)")
     ("i,agent-id", "Agent ID to be added to JSON frames", value<string>())
     ("inspect", "Inspect the FMU and exit");
   // clang-format on
@@ -179,6 +183,21 @@ int main(int argc, char *const *argv) {
          << fg::reset << endl;
     jacobian = false;
   }
+  closed_loop = settings.value("closed_loop", closed_loop);
+  if (options_parsed.count("closed-loop") != 0) {
+    closed_loop = true;
+  }
+  if (closed_loop && plant.get_type() != static_cast<int>(FmuType::ModelExchange)) {
+    cout << fg::yellow << "Closed loop is available for Model Exchange FMUs only: disabled"
+         << fg::reset << endl;
+    closed_loop = false;
+  }
+  if (closed_loop && !trigger_mode) {
+    cout << fg::yellow << "Closed loop needs trigger mode: trigger mode enabled"
+         << fg::reset << endl;
+    trigger_mode = true;
+  }
+
   // if jacobian is enabled
   auto add_jacobian = [&](json &st) {
     if (jacobian && (step_count++ % jacobian_every == 0)) {
@@ -186,6 +205,66 @@ int main(int argc, char *const *argv) {
       plant.get_jacobian(jac);
       st["jacobian"] = jac;
     }
+  };
+
+  // Closed loop (Model Exchange only) ----------------------------------------
+  // State names in fmi3GetContinuousStates order (= rows of the Jacobian)
+  const vector<string> state_names =
+      closed_loop ? plant.get_state_names() : vector<string>{};
+
+  // Apply a state update received from MADS:
+  //   "fmu_state"            : absolute values
+  //   "fmu_state_correction" : added to the current values
+  // each either an array with all the states (Jacobian order) or an object
+  // {state name: value} with a subset of them. All or nothing: if anything is
+  // wrong, no state is changed. Returns "none", "absolute", "additive",
+  // "absolute+additive" or "rejected: <reason>".
+  auto apply_state = [&](json const &in) -> string {
+    const bool has_abs = in.contains("fmu_state");
+    const bool has_corr = in.contains("fmu_state_correction");
+    if (!has_abs && !has_corr) return "none";
+    vector<double> x;
+    plant.get_continuous_states(x);
+    auto update = [&](json const &j, bool additive) -> string {
+      if (j.is_array()) {
+        if (j.size() != x.size()) {
+          return "expected " + to_string(x.size()) + " values, got " +
+                 to_string(j.size());
+        }
+        for (size_t i = 0; i < x.size(); ++i) {
+          if (!j[i].is_number()) return "element " + to_string(i) + " is not a number";
+          x[i] = additive ? x[i] + j[i].get<double>() : j[i].get<double>();
+        }
+        return "";
+      }
+      if (j.is_object()) {
+        for (auto const &[k, v] : j.items()) {
+          auto it = find(state_names.begin(), state_names.end(), k);
+          if (it == state_names.end()) return "unknown state '" + k + "'";
+          if (!v.is_number()) return "state '" + k + "' is not a number";
+          const size_t i = it - state_names.begin();
+          x[i] = additive ? x[i] + v.get<double>() : v.get<double>();
+        }
+        return "";
+      }
+      return "must be an array or an object";
+    };
+    string err;
+    if (has_abs && !(err = update(in["fmu_state"], false)).empty())
+      return "rejected: fmu_state " + err;
+    if (has_corr && !(err = update(in["fmu_state_correction"], true)).empty())
+      return "rejected: fmu_state_correction " + err;
+    plant.set_continuous_states(x);
+    return has_abs && has_corr ? "absolute+additive" : (has_abs ? "absolute" : "additive");
+  };
+
+  // Add the (predicted) state to the status, for the filter to correct
+  auto add_state = [&](json &st, string const &correction) {
+    vector<double> x, xdot;
+    plant.get_continuous_states(x);
+    plant.get_continuous_state_derivatives(xdot);
+    st["state"] = {{"names", state_names}, {"x", x}, {"xdot", xdot},
+                   {"correction", correction}};
   };
 
   // Connection
@@ -217,6 +296,9 @@ int main(int argc, char *const *argv) {
                            : "central differences")
                     : "off")
        << (jacobian ? ", every " + to_string(jacobian_every) + " step(s)" : "")
+       << style::reset << endl
+       << "  closed loop:     " << style::bold
+       << (closed_loop ? "on, " + to_string(state_names.size()) + " states" : "off")
        << style::reset << endl;
   plant._solver_params._rel_tol = 1e-5;
   plant._solver_params._abs_tol = 1e-7;
@@ -282,7 +364,59 @@ int main(int argc, char *const *argv) {
     }
   };
 
-  if (trigger_mode) {
+  if (trigger_mode && closed_loop) {
+    // Closed loop: on each message FIRST apply reset / inputs / state update
+    // (the correction refers to the state published with the previous
+    // message), THEN integrate by "fmu_dt" seconds (wall-clock time since the
+    // previous message if absent; 0 = apply and publish without stepping) and
+    // publish the predicted state for the next correction.
+    agent.loop([&]() -> chrono::milliseconds {
+      if (agent.receive(false) == message_type::json && agent.last_topic() != "control") {
+        now = chrono::steady_clock::now();
+        auto msg = agent.last_message();
+        auto in = json::parse(get<1>(msg));
+        if (in.contains("fmu_reset") || in.contains("fmu_input")) {
+          process_input(in, true); // a reset skips the inputs of its message
+        }
+        string correction;
+        try {
+          correction = apply_state(in);
+        } catch (const std::exception &e) {
+          correction = string("rejected: ") + e.what();
+        }
+        if (correction.rfind("rejected", 0) == 0) {
+          console_out[0] = to_string(t) + " s, State " + correction;
+        }
+        if (in.contains("fmu_dt") && in["fmu_dt"].is_number()) {
+          dt = in["fmu_dt"].get<double>();
+        } else {
+          dt = chrono::duration_cast<chrono::microseconds>(now - last_timestep)
+                   .count() / 1e6;
+        }
+        last_timestep = now;
+        if (dt > 0) {
+          t += dt;
+          plant.do_step(dt);
+        }
+        console_out[2] = to_string(t) + " s";
+        plant.get_status(status);
+        add_state(status, correction);
+        add_jacobian(status);
+        auto tet = chrono::steady_clock::now() - now;
+        status["TET"] =
+          chrono::duration_cast<chrono::microseconds>(tet).count();
+        agent.publish(status);
+      }
+
+      cout << goback(4) << fg::yellow << "Last message: " << console_out[0]
+        << fg::reset << endl
+        << "Received: " << console_out[1] << endl
+        << "Status update after: " << console_out[2] << endl
+        << "Simulation dt: " << dt << "s" << endl;
+
+      return 0ms;
+    });
+  } else if (trigger_mode) {
     agent.loop([&]() -> chrono::milliseconds {
       if (agent.receive(false) == message_type::json && agent.last_topic() != "control") {
         now = chrono::steady_clock::now();

@@ -1216,6 +1216,56 @@ void FmuWrapper::get_jacobian(json &jac) {
   jac["B"] = jB;
 }
 
+// Continuous state access (Model Exchange only) -------------------------------
+
+size_t FmuWrapper::get_num_states() {
+  if (!_instance || !_initialized) {
+    throw std::runtime_error("FMU instance not initialized");
+  }
+  if (_type != FmuType::ModelExchange) {
+    throw std::runtime_error("Continuous states are available for Model Exchange FMUs only");
+  }
+  size_t nx = 0;
+  check_status(fmi3_getNumberOfContinuousStates(_instance, &nx),
+               "getNumberOfContinuousStates");
+  return nx;
+}
+
+std::vector<std::string> FmuWrapper::get_state_names() {
+  const size_t nx = get_num_states();
+  if (_state_names.size() == nx) {
+    return _state_names;
+  }
+  std::vector<std::string> names; // fallback when the XML gives no names
+  for (size_t i = 0; i < nx; ++i) {
+    names.push_back("x" + std::to_string(i));
+  }
+  return names;
+}
+
+void FmuWrapper::get_continuous_states(std::vector<double> &x) {
+  x.resize(get_num_states());
+  check_status(fmi3_getContinuousStates(_instance, x.data(), x.size()),
+               "getContinuousStates");
+}
+
+void FmuWrapper::set_continuous_states(const std::vector<double> &x) {
+  const size_t nx = get_num_states();
+  if (x.size() != nx) {
+    throw std::runtime_error("set_continuous_states: expected " +
+                             std::to_string(nx) + " values, got " +
+                             std::to_string(x.size()));
+  }
+  check_status(fmi3_setContinuousStates(_instance, x.data(), nx),
+               "setContinuousStates");
+}
+
+void FmuWrapper::get_continuous_state_derivatives(std::vector<double> &xdot) {
+  xdot.resize(get_num_states());
+  get_state_derivatives(xdot.data(), xdot.size(),
+                        "getContinuousStateDerivatives");
+}
+
 void FmuWrapper::set_real(const std::string &name, double value) {
   if (!_instance || !_initialized) {
     throw std::runtime_error("FMU instance not initialized");
