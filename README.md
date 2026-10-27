@@ -156,3 +156,47 @@ The published status then contains a `jacobian` object:
 - The FMU states and inputs are restored after the computation, so the simulation is not affected.
 - For co-simulation FMUs the option is ignored with a warning: FMI 3.0 gives no access to the internal states of a co-simulation FMU.
 
+## Closed loop (Model Exchange only)
+
+In closed-loop mode the agent accepts **state corrections** from another agent on the MADS network (e.g. a Kalman filter), so that the model is pulled back towards the real system at every step:
+
+```toml
+[fmu_<model_name>]
+closed_loop = true   # or -c / --closed-loop on the command line
+jacobian = true      # usually needed by the filter as well
+```
+
+Closed loop implies trigger mode (it is enabled automatically). On every received message the agent:
+
+1. applies `fmu_reset` / `fmu_input`, as usual (a reset skips the inputs of the same message);
+2. applies the state update, if any (it refers to the state published with the previous message);
+3. integrates for `fmu_dt` seconds (wall-clock time since the previous message if `fmu_dt` is missing; `"fmu_dt": 0` applies the message and publishes without integrating, e.g. to set the initial state);
+4. publishes the status, with the predicted state for the next correction (and the Jacobian, if enabled).
+
+State updates use the order of `fmi3GetContinuousStates`, which is also the order of the Jacobian rows:
+
+```json
+{
+  "fmu_input": { "torque_in": [0.1, 0.0, 0.2, 0.0, 0.0] },
+  "fmu_state_correction": { "ContState3": 0.001, "ContState4": -0.02 },
+  "fmu_dt": 0.001
+}
+```
+
+- `fmu_state`: absolute values; `fmu_state_correction`: added to the current values. Both can be in the same message (absolute first).
+- Each one is either an array with **all** the states, or an object `{state name: value}` with a **subset** of them.
+- All or nothing: if a value is not a number, a name is unknown or the array has the wrong length, no state is changed and the reason is reported in the status.
+- Use `fmu_dt` with the sensor sampling period: the wall-clock time between messages includes the network jitter.
+
+In closed-loop mode the published status also contains a `state` object:
+
+```json
+"state": {
+  "names": ["ContState1", "ContState2"],
+  "x":     [0.0, 0.1],
+  "xdot":  [0.1, -2.0],
+  "correction": "additive"
+}
+```
+
+`x` and `xdot` are the states and their derivatives at the end of the step, with the inputs of the message; `correction` is `none`, `absolute`, `additive`, `absolute+additive` or `rejected: <reason>`.
